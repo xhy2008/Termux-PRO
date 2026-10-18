@@ -94,7 +94,7 @@ public class TermuxPluginUtils {
                 sendPluginCommandErrorNotification(context, logTag, null,
                     ResultData.getErrorsListMinimalString(resultData),
                     ExecutionCommand.getExecutionCommandMarkdownString(executionCommand),
-                    false, true, TermuxUtils.AppInfoMode.TERMUX_AND_CALLING_PACKAGE,true,
+                    false, true, true, true,
                     executionCommand.resultConfig.resultPendingIntent != null ? executionCommand.resultConfig.resultPendingIntent.getCreatorPackage(): null);
             }
 
@@ -200,7 +200,7 @@ public class TermuxPluginUtils {
         sendPluginCommandErrorNotification(context, logTag, null,
             ResultData.getErrorsListMinimalString(resultData),
             ExecutionCommand.getExecutionCommandMarkdownString(executionCommand),
-            forceNotification, true, TermuxUtils.AppInfoMode.TERMUX_AND_CALLING_PACKAGE, true,
+            forceNotification, true, true, true,
             executionCommand.resultConfig.resultPendingIntent != null ? executionCommand.resultConfig.resultPendingIntent.getCreatorPackage(): null);
     }
 
@@ -294,7 +294,7 @@ public class TermuxPluginUtils {
                                                          boolean addDeviceInfo) {
         sendPluginCommandErrorNotification(currentPackageContext, logTag,
             title, notificationTextString, "## " + title + "\n\n" + message + "\n\n",
-            forceNotification, showToast, TermuxUtils.AppInfoMode.TERMUX_AND_PLUGIN_PACKAGE, addDeviceInfo, null);
+            forceNotification, showToast, true, addDeviceInfo, null);
     }
 
     /**
@@ -311,7 +311,7 @@ public class TermuxPluginUtils {
      *                          {@link TermuxPreferenceConstants.TERMUX_APP#KEY_PLUGIN_ERROR_NOTIFICATIONS_ENABLED}
      *                          is {@code false}.
      * @param showToast If set to {@code true}, then a toast will be shown for {@code notificationTextString}.
-     * @param appInfoMode The {@link TermuxUtils.AppInfoMode} to use to add app info to the message.
+     * @param addAppInfo If set to {@code true}, then app info should be appended to the message.
      *                    Set to {@code null} if app info should not be appended to the message.
      * @param addDeviceInfo If set to {@code true}, then device info should be appended to the message.
      * @param callingPackageName The optional package name of the app for which the plugin command
@@ -322,7 +322,7 @@ public class TermuxPluginUtils {
                                                           String notificationTextString,
                                                           String message, boolean forceNotification,
                                                           boolean showToast,
-                                                          TermuxUtils.AppInfoMode appInfoMode,
+                                                          boolean addAppInfo,
                                                           boolean addDeviceInfo,
                                                           String callingPackageName) {
         // Note: Do not change currentPackageContext or termuxPackageContext passed to functions or things will break
@@ -357,9 +357,8 @@ public class TermuxPluginUtils {
 
         StringBuilder reportString = new StringBuilder(message);
 
-        if (appInfoMode != null)
-            reportString.append("\n\n").append(TermuxUtils.getAppInfoMarkdownString(currentPackageContext, appInfoMode,
-                callingPackageName != null ? callingPackageName : currentPackageName));
+        if (addAppInfo)
+            reportString.append("\n\n").append(TermuxUtils.getAppInfoMarkdownString(currentPackageContext));
 
         if (addDeviceInfo)
             reportString.append("\n\n").append(AndroidUtils.getDeviceInfoMarkdownString(currentPackageContext, true));

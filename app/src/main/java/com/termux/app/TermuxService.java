@@ -18,8 +18,7 @@ import android.os.PowerManager;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import com.termux.R;
-import com.termux.app.event.SystemEventReceiver;
+import com.termux.pro.R;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.TermuxTerminalSessionServiceClient;
 import com.termux.shared.termux.plugins.TermuxPluginUtils;
@@ -119,7 +118,6 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
         runStartForeground();
 
-        SystemEventReceiver.registerPackageUpdateEvents(this);
     }
 
     @SuppressLint("Wakelock")
@@ -177,7 +175,6 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
         TermuxShellManager.onAppExit(this);
 
-        SystemEventReceiver.unregisterPackageUpdateEvents(this);
 
         runStopForeground();
     }

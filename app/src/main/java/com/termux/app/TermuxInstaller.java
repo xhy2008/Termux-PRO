@@ -7,67 +7,105 @@ import android.content.Context;
 import android.os.Build;
 import android.os.Environment;
 import android.system.Os;
-import android.util.Pair;
-import android.view.WindowManager;
 
-import com.termux.R;
+import com.termux.pro.R;
+import com.termux.shared.errors.Error;
 import com.termux.shared.file.FileUtils;
-import com.termux.shared.termux.crash.TermuxCrashUtils;
-import com.termux.shared.termux.file.TermuxFileUtils;
-import com.termux.shared.interact.MessageDialogUtils;
+import com.termux.shared.android.PackageUtils;
 import com.termux.shared.logger.Logger;
 import com.termux.shared.markdown.MarkdownUtils;
-import com.termux.shared.errors.Error;
-import com.termux.shared.android.PackageUtils;
+import com.termux.shared.interact.MessageDialogUtils;
 import com.termux.shared.termux.TermuxConstants;
 import com.termux.shared.termux.TermuxUtils;
+import com.termux.shared.termux.crash.TermuxCrashUtils;
+import com.termux.shared.termux.file.TermuxFileUtils;
 import com.termux.shared.termux.shell.command.environment.TermuxShellEnvironment;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStreamReader;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
 
-import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR;
+import java.io.File;
+import java.io.BufferedInputStream;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
 import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR_PATH;
-import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR;
-import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR_PATH;
 
 /**
- * Install the Termux bootstrap packages if necessary by following the below steps:
- * <p/>
- * (1) If $PREFIX already exist, assume that it is correct and be done. Note that this relies on that we do not create a
- * broken $PREFIX directory below.
- * <p/>
- * (2) A progress dialog is shown with "Installing..." message and a spinner.
- * <p/>
- * (3) A staging directory, $STAGING_PREFIX, is cleared if left over from broken installation below.
- * <p/>
- * (4) The zip file is loaded from a shared library.
- * <p/>
- * (5) The zip, containing entries relative to the $PREFIX, is is downloaded and extracted by a zip input stream
- * continuously encountering zip file entries:
- * <p/>
- * (5.1) If the zip entry encountered is SYMLINKS.txt, go through it and remember all symlinks to setup.
- * <p/>
- * (5.2) For every other zip entry, extract it into $STAGING_PREFIX and set execute permissions if necessary.
+ * Installs the Debian guest rootfs the {@code com.termux.pro} sessions run in.
+ *
+ * (1) If the rootfs directory already exists, assume that it is correct and be done.
+ * (2) A progress dialog is shown while the rootfs tarball is downloaded and extracted.
+ * (3) The tarball is extracted into a staging directory, then moved into place, so that a failed
+ *     install never leaves a half installed rootfs behind.
+ * (4) Guest configuration files that depend on the host paths are written into the new rootfs.
  */
-final class TermuxInstaller {
+public final class TermuxInstaller {
 
     private static final String LOG_TAG = "TermuxInstaller";
 
-    /** Performs bootstrap setup if necessary. */
-    static void setupBootstrapIfNeeded(final Activity activity, final Runnable whenDone) {
+    /**
+     * Directory of the pinned Debian lxc image on the mirrors. The image is pinned by date since
+     * the mirrors only expose "latest" through a symlink that is not served, so this has to be
+     * bumped manually to pick up a newer build.
+     */
+    private static final String ROOTFS_IMAGE_PATH =
+        "lxc-images/images/debian/trixie/arm64/default/20261015_05%3A24/rootfs.tar.xz";
+
+    /**
+     * SHA-256 of the image above, as published in the {@code SHA256SUMS} file next to it, so that a
+     * truncated or corrupted download is never extracted into a half installed rootfs.
+     */
+    private static final String ROOTFS_IMAGE_SHA256 =
+        "7d4fd0be487a4ee54a574fba49312f95e9151a2a2052f2eab9ac46ca5860c6df";
+
+    /**
+     * Mirrors hosting the image. The image path is relative to each mirror root.
+     *
+     * Mirrors.tuna.tsinghua.edu.cn and its clones are deliberately not used: their anti-leech rule
+     * answers HTTP 403 to every request made by a Java HTTP client, whatever the User-Agent header
+     * says, so they can never be reached from the app.
+     */
+    private static final String[] ROOTFS_URLS = {
+        "https://mirrors.nju.edu.cn/" + ROOTFS_IMAGE_PATH,
+        "https://mirrors.sdu.edu.cn/" + ROOTFS_IMAGE_PATH,
+        "https://images.linuxcontainers.org/images/debian/trixie/arm64/default/20261015_05%3A24/rootfs.tar.xz",
+    };
+
+    /** apt mirror used by the guest for the archive and its updates. */
+    private static final String DEBIAN_MIRROR_URL = "https://mirrors.cloud.tencent.com/debian";
+
+    /**
+     * apt mirror used by the guest for security updates. Debian keeps the security suite in its own
+     * archive instead of under {@code debian/}, so it needs a separate url.
+     */
+    private static final String DEBIAN_SECURITY_MIRROR_URL = "https://mirrors.cloud.tencent.com/debian-security";
+
+    private static final String RESOLV_CONF =
+        "nameserver 223.5.5.5\n" +
+        "nameserver 119.29.29.29\n";
+
+    private static final String SOURCES_LIST =
+        "deb " + DEBIAN_MIRROR_URL + " trixie main contrib\n" +
+        "deb " + DEBIAN_MIRROR_URL + " trixie-updates main contrib\n" +
+        "deb " + DEBIAN_SECURITY_MIRROR_URL + " trixie-security main contrib\n";
+
+    private TermuxInstaller() { }
+
+    /** Performs rootfs setup if necessary. */
+    public static void setupBootstrapIfNeeded(final Activity activity, final Runnable whenDone) {
         String bootstrapErrorMessage;
         Error filesDirectoryAccessibleError;
 
-        // This will also call Context.getFilesDir(), which should ensure that termux files directory
-        // is created if it does not already exist
+        // This will also call Context.getFilesDir(), which should ensure that the termux files
+        // directory is created if it does not already exist
         filesDirectoryAccessibleError = TermuxFileUtils.isTermuxFilesDirectoryAccessible(activity, true, true);
         boolean isFilesDirectoryAccessible = filesDirectoryAccessibleError == null;
 
@@ -102,130 +140,21 @@ final class TermuxInstaller {
             return;
         }
 
-        // If prefix directory exists, even if its a symlink to a valid directory and symlink is not broken/dangling
-        if (FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true)) {
-            if (TermuxFileUtils.isTermuxPrefixDirectoryEmpty()) {
-                Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" exists but is empty or only contains specific unimportant files.");
-            } else {
-                whenDone.run();
-                return;
-            }
-        } else if (FileUtils.fileExists(TERMUX_PREFIX_DIR_PATH, false)) {
-            Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" does not exist but another file exists at its destination.");
+        if (isRootfsInstalled()) {
+            whenDone.run();
+            return;
         }
 
-        final ProgressDialog progress = ProgressDialog.show(activity, null, activity.getString(R.string.bootstrap_installer_body), true, false);
+        final ProgressDialog progress = ProgressDialog.show(activity, null,
+            activity.getString(R.string.bootstrap_installer_body), true, false);
         new Thread() {
             @Override
             public void run() {
                 try {
-                    Logger.logInfo(LOG_TAG, "Installing " + TermuxConstants.TERMUX_APP_NAME + " bootstrap packages.");
-
-                    Error error;
-
-                    // Delete prefix staging directory or any file at its destination
-                    error = FileUtils.deleteFile("termux prefix staging directory", TERMUX_STAGING_PREFIX_DIR_PATH, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
-
-                    // Delete prefix directory or any file at its destination
-                    error = FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
-
-                    // Create prefix staging directory if it does not already exist and set required permissions
-                    error = TermuxFileUtils.isTermuxPrefixStagingDirectoryAccessible(true, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
-
-                    // Create prefix directory if it does not already exist and set required permissions
-                    error = TermuxFileUtils.isTermuxPrefixDirectoryAccessible(true, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
-
-                    Logger.logInfo(LOG_TAG, "Extracting bootstrap zip to prefix staging directory \"" + TERMUX_STAGING_PREFIX_DIR_PATH + "\".");
-
-                    final byte[] buffer = new byte[8096];
-                    final List<Pair<String, String>> symlinks = new ArrayList<>(50);
-
-                    final byte[] zipBytes = loadZipBytes();
-                    try (ZipInputStream zipInput = new ZipInputStream(new ByteArrayInputStream(zipBytes))) {
-                        ZipEntry zipEntry;
-                        while ((zipEntry = zipInput.getNextEntry()) != null) {
-                            if (zipEntry.getName().equals("SYMLINKS.txt")) {
-                                BufferedReader symlinksReader = new BufferedReader(new InputStreamReader(zipInput));
-                                String line;
-                                while ((line = symlinksReader.readLine()) != null) {
-                                    String[] parts = line.split("←");
-                                    if (parts.length != 2)
-                                        throw new RuntimeException("Malformed symlink line: " + line);
-                                    String oldPath = parts[0];
-                                    String newPath = TERMUX_STAGING_PREFIX_DIR_PATH + "/" + parts[1];
-                                    symlinks.add(Pair.create(oldPath, newPath));
-
-                                    error = ensureDirectoryExists(new File(newPath).getParentFile());
-                                    if (error != null) {
-                                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                                        return;
-                                    }
-                                }
-                            } else {
-                                String zipEntryName = zipEntry.getName();
-                                File targetFile = new File(TERMUX_STAGING_PREFIX_DIR_PATH, zipEntryName);
-                                boolean isDirectory = zipEntry.isDirectory();
-
-                                error = ensureDirectoryExists(isDirectory ? targetFile : targetFile.getParentFile());
-                                if (error != null) {
-                                    showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                                    return;
-                                }
-
-                                if (!isDirectory) {
-                                    try (FileOutputStream outStream = new FileOutputStream(targetFile)) {
-                                        int readBytes;
-                                        while ((readBytes = zipInput.read(buffer)) != -1)
-                                            outStream.write(buffer, 0, readBytes);
-                                    }
-                                    if (zipEntryName.startsWith("bin/") || zipEntryName.startsWith("libexec") ||
-                                        zipEntryName.startsWith("lib/apt/apt-helper") || zipEntryName.startsWith("lib/apt/methods")) {
-                                        //noinspection OctalInteger
-                                        Os.chmod(targetFile.getAbsolutePath(), 0700);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (symlinks.isEmpty())
-                        throw new RuntimeException("No SYMLINKS.txt encountered");
-                    for (Pair<String, String> symlink : symlinks) {
-                        Os.symlink(symlink.first, symlink.second);
-                    }
-
-                    Logger.logInfo(LOG_TAG, "Moving termux prefix staging to prefix directory.");
-
-                    if (!TERMUX_STAGING_PREFIX_DIR.renameTo(TERMUX_PREFIX_DIR)) {
-                        throw new RuntimeException("Moving termux prefix staging to prefix directory failed");
-                    }
-
-                    Logger.logInfo(LOG_TAG, "Bootstrap packages installed successfully.");
-
-                    // Recreate env file since termux prefix was wiped earlier
-                    TermuxShellEnvironment.writeEnvironmentToFile(activity);
-
-                    activity.runOnUiThread(whenDone);
-
-                } catch (final Exception e) {
-                    showBootstrapErrorDialog(activity, whenDone, Logger.getStackTracesMarkdownString(null, Logger.getStackTracesStringArray(e)));
-
+                    installRootfs(progress, activity, whenDone);
+                } catch (Exception e) {
+                    showBootstrapErrorDialog(activity, whenDone, Logger.getStackTracesMarkdownString(null,
+                        Logger.getStackTracesStringArray(e)));
                 } finally {
                     activity.runOnUiThread(() -> {
                         try {
@@ -239,6 +168,265 @@ final class TermuxInstaller {
         }.start();
     }
 
+    /** Check if a usable rootfs is installed. */
+    public static boolean isRootfsInstalled() {
+        // The bash binary of the guest is what every session is started with, so its presence is
+        // used as the marker for a fully installed rootfs.
+        return new File(TermuxConstants.TERMUX_ROOTFS_DIR_PATH + "/bin/bash").isFile() ||
+            new File(TermuxConstants.TERMUX_ROOTFS_DIR_PATH + "/usr/bin/bash").isFile();
+    }
+
+    private static void installRootfs(ProgressDialog progress, Activity activity, Runnable whenDone) throws Exception {
+        Logger.logInfo(LOG_TAG, "Installing " + TermuxConstants.TERMUX_APP_NAME + " rootfs.");
+
+        File stagingDir = new File(TermuxConstants.TERMUX_STAGING_PREFIX_DIR_PATH);
+        FileUtils.deleteFile("rootfs staging directory", stagingDir.getAbsolutePath(), true);
+        FileUtils.deleteFile("rootfs directory", TermuxConstants.TERMUX_ROOTFS_DIR_PATH, true);
+
+        Error error = FileUtils.createDirectoryFile("rootfs staging directory", stagingDir.getAbsolutePath());
+        if (error != null)
+            throw new IOException(error.getMessage());
+
+        downloadRootfs(stagingDir);
+        writeGuestConfig(stagingDir);
+
+        File rootfsDir = new File(TermuxConstants.TERMUX_ROOTFS_DIR_PATH);
+        if (!stagingDir.renameTo(rootfsDir))
+            throw new IOException("Moving rootfs staging directory to \"" + rootfsDir.getAbsolutePath() + "\" failed");
+
+        // Make sure the directories the sessions need exist inside the app files directory
+        FileUtils.createDirectoryFile("termux home directory", TermuxConstants.TERMUX_HOME_DIR_PATH);
+        FileUtils.createDirectoryFile("termux tmpfs directory", TermuxShellEnvironment.getProrootTmpDir(activity));
+
+        Logger.logInfo(LOG_TAG, "Rootfs installed successfully.");
+
+        activity.runOnUiThread(whenDone);
+    }
+
+    /** Try every mirror in order until one of them yields a verified rootfs. */
+    private static void downloadRootfs(File stagingDir) throws IOException {
+        IOException lastException = null;
+
+        for (String urlString : ROOTFS_URLS) {
+            Logger.logInfo(LOG_TAG, "Downloading rootfs from \"" + urlString + "\".");
+            try {
+                downloadAndExtractRootfs(urlString, stagingDir);
+                Logger.logInfo(LOG_TAG, "Rootfs downloaded and extracted from \"" + urlString + "\".");
+                return;
+            } catch (IOException e) {
+                Logger.logError(LOG_TAG, "Downloading rootfs from \"" + urlString + "\" failed: " + e.getMessage());
+                lastException = e;
+                FileUtils.deleteFile("rootfs staging directory", stagingDir.getAbsolutePath(), true);
+                if (!stagingDir.mkdirs())
+                    throw new IOException("Create rootfs staging directory \"" + stagingDir.getAbsolutePath() + "\" failed");
+            }
+        }
+
+        throw lastException != null ? lastException : new IOException("No rootfs mirror available");
+    }
+
+    /**
+     * Download the tarball of one mirror into a temporary file, check its hash and extract it into
+     * {@code targetDir}.
+     *
+     * The download is buffered to a file instead of being piped into the extractor so that a
+     * connection dropped in the middle fails loudly on the hash check instead of leaving a
+     * partially extracted rootfs behind.
+     */
+    private static void downloadAndExtractRootfs(String urlString, File targetDir) throws IOException {
+        File tarFile = new File(targetDir.getParentFile(), "rootfs.tar.xz");
+        try {
+            downloadRootfs(urlString, tarFile);
+
+            String actual = sha256OfFile(tarFile);
+            if (!ROOTFS_IMAGE_SHA256.equalsIgnoreCase(actual))
+                throw new IOException("SHA-256 of \"" + tarFile.getName() + "\" is " + actual +
+                    ", expected " + ROOTFS_IMAGE_SHA256);
+
+            try (InputStream in = new BufferedInputStream(new FileInputStream(tarFile))) {
+                extractRootfs(in, targetDir);
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(tarFile.toPath());
+        }
+    }
+
+    private static void downloadRootfs(String urlString, File destination) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(urlString).openConnection();
+        connection.setInstanceFollowRedirects(true);
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(30000);
+        try {
+            int responseCode = connection.getResponseCode();
+            if (responseCode != HttpURLConnection.HTTP_OK)
+                throw new IOException("HTTP response code " + responseCode + " for \"" + urlString + "\"");
+
+            long expectedLength = connection.getContentLengthLong();
+            try (InputStream in = new BufferedInputStream(connection.getInputStream());
+                 FileOutputStream out = new FileOutputStream(destination)) {
+                byte[] buffer = new byte[64 * 1024];
+                long total = 0;
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                    total += read;
+                }
+                if (expectedLength > 0 && total != expectedLength)
+                    throw new IOException("Downloaded " + total + " of " + expectedLength +
+                        " bytes from \"" + urlString + "\"");
+                Logger.logInfo(LOG_TAG, "Downloaded " + total + " bytes.");
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    /** Compute the lowercase hex SHA-256 of a file. */
+    private static String sha256OfFile(File file) throws IOException {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            try (InputStream in = new BufferedInputStream(new FileInputStream(file))) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = in.read(buffer)) != -1)
+                    digest.update(buffer, 0, read);
+            }
+            StringBuilder builder = new StringBuilder(64);
+            for (byte b : digest.digest())
+                builder.append(Character.forDigit((b >> 4) & 0xf, 16)).append(Character.forDigit(b & 0xf, 16));
+            return builder.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 is not available", e);
+        }
+    }
+
+    /**
+     * Extract the {@code rootfs.tar.xz} stream into {@code targetDir}.
+     *
+     * The tarball is owned by root and the app has neither root nor hardlink permissions on app
+     * private storage, so ownership and modes are ignored, hardlinks are recreated as copies and
+     * device and fifo entries are skipped since proroot provides {@code /dev} at runtime.
+     */
+    private static void extractRootfs(InputStream compressionStream, File targetDir) throws IOException {
+        // The archive contains the "." entry itself, so the staging directory is a valid
+        // extraction target and must be allowed next to its descendants.
+        String targetPath = targetDir.getCanonicalPath();
+
+        try (XZCompressorInputStream xzStream = new XZCompressorInputStream(compressionStream);
+             TarArchiveInputStream tarStream = new TarArchiveInputStream(xzStream)) {
+
+            TarArchiveEntry entry;
+            while ((entry = tarStream.getNextEntry()) != null) {
+                File targetFile = new File(targetDir, entry.getName());
+
+                // Reject entries that would escape the target directory
+                String entryPath = targetFile.getCanonicalPath();
+                if (!entryPath.equals(targetPath) && !entryPath.startsWith(targetPath + File.separator))
+                    throw new IOException("Rootfs entry outside of target directory: " + entry.getName());
+
+                if (entry.isDirectory()) {
+                    if (!targetFile.isDirectory() && !targetFile.mkdirs() && !targetFile.isDirectory())
+                        throw new IOException("Create directory \"" + targetFile.getAbsolutePath() + "\" failed");
+                    continue;
+                }
+
+                File parent = targetFile.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())
+                    throw new IOException("Create directory \"" + parent.getAbsolutePath() + "\" failed");
+
+                if (entry.isSymbolicLink()) {
+                    // Files.deleteIfExists() removes the link itself instead of following it, which
+                    // is what a dangling or previously extracted link needs before replacement.
+                    deleteIfExists(targetFile);
+                    try {
+                        Os.symlink(entry.getLinkName(), targetFile.getAbsolutePath());
+                    } catch (android.system.ErrnoException e) {
+                        throw new IOException("Create symlink \"" + targetFile.getAbsolutePath() + "\" failed", e);
+                    }
+                } else if (entry.isLink()) {
+                    // Hardlinks are not permitted on app private storage, copy the target instead.
+                    deleteIfExists(targetFile);
+                    copyFile(new File(targetDir, entry.getLinkName()), targetFile);
+                } else if (entry.isFile()) {
+                    deleteIfExists(targetFile);
+                    try (FileOutputStream out = new FileOutputStream(targetFile)) {
+                        byte[] buffer = new byte[64 * 1024];
+                        int read;
+                        while ((read = tarStream.read(buffer)) != -1)
+                            out.write(buffer, 0, read);
+                    }
+                    // Only the executable bit matters, the app is the owner of every file.
+                    if ((entry.getMode() & 0100) != 0)
+                        targetFile.setExecutable(true, false);
+                }
+            }
+        }
+    }
+
+    private static void copyFile(File source, File destination) throws IOException {
+        try (InputStream in = new java.io.FileInputStream(source);
+             FileOutputStream out = new FileOutputStream(destination)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1)
+                out.write(buffer, 0, read);
+        }
+    }
+
+    /** Write the guest files that the Debian image does not provide on its own. */
+    private static void writeGuestConfig(File rootfsDir) throws IOException {
+        // The image points /etc/resolv.conf at the systemd-resolved stub socket, which does not run here.
+        File resolvConf = new File(rootfsDir, "etc/resolv.conf");
+        deleteIfExists(resolvConf);
+        writeFile(resolvConf, RESOLV_CONF);
+
+        File aptDir = new File(rootfsDir, "etc/apt");
+        File sourcesList = new File(aptDir, "sources.list");
+        deleteIfExists(sourcesList);
+        writeFile(sourcesList, SOURCES_LIST);
+
+        // systemd and its helpers cannot run in the guest, so keep them from being pulled in as
+        // recommends and from touching the init system on package install.
+        writeFile(new File(rootfsDir, "etc/apt/apt.conf.d/90termux-pro"),
+            "APT::Install-Recommends \"false\";\n" +
+            "APT::Install-Suggests \"false\";\n" +
+            "dpkg::options { \"--force-confnew\"; }\n");
+
+        // The guest home of the user is the app files home directory, so seed it with the Debian
+        // default dotfiles the image ships for new users.
+        File skelDir = new File(rootfsDir, "etc/skel");
+        File homeDir = new File(TermuxConstants.TERMUX_HOME_DIR_PATH);
+        if (!homeDir.isDirectory() && !homeDir.mkdirs() && !homeDir.isDirectory())
+            throw new IOException("Create home directory \"" + homeDir.getAbsolutePath() + "\" failed");
+        for (String dotFile : new String[]{".bashrc", ".profile"}) {
+            File source = new File(skelDir, dotFile);
+            File destination = new File(homeDir, dotFile);
+            if (source.isFile() && !java.nio.file.Files.exists(destination.toPath()))
+                copyFile(source, destination);
+        }
+    }
+
+    /**
+     * Delete a file, symlink or directory entry if it exists.
+     *
+     * {@link java.nio.file.Files#deleteIfExists(java.nio.file.Path)} is used instead of
+     * {@link File#exists()} and {@link File#delete()} since it does not follow symlinks, so
+     * dangling symlinks like the {@code /etc/resolv.conf} of the Debian image are removed as well
+     * instead of being reported as non existent.
+     */
+    private static void deleteIfExists(File file) throws IOException {
+        java.nio.file.Files.deleteIfExists(file.toPath());
+    }
+
+    private static void writeFile(File file, String content) throws IOException {
+        File parent = file.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())
+            throw new IOException("Create directory \"" + parent.getAbsolutePath() + "\" failed");
+        try (Writer writer = new OutputStreamWriter(new FileOutputStream(file))) {
+            writer.write(content);
+        }
+    }
+
     public static void showBootstrapErrorDialog(Activity activity, Runnable whenDone, String message) {
         Logger.logErrorExtended(LOG_TAG, "Bootstrap Error:\n" + message);
 
@@ -247,17 +435,18 @@ final class TermuxInstaller {
 
         activity.runOnUiThread(() -> {
             try {
-                new AlertDialog.Builder(activity).setTitle(R.string.bootstrap_error_title).setMessage(R.string.bootstrap_error_body)
+                new AlertDialog.Builder(activity).setTitle(R.string.bootstrap_error_title)
+                    .setMessage(activity.getString(R.string.bootstrap_error_body) + "\n\n" + message)
                     .setNegativeButton(R.string.bootstrap_error_abort, (dialog, which) -> {
                         dialog.dismiss();
                         activity.finish();
                     })
                     .setPositiveButton(R.string.bootstrap_error_try_again, (dialog, which) -> {
                         dialog.dismiss();
-                        FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                        FileUtils.deleteFile("rootfs directory", TermuxConstants.TERMUX_ROOTFS_DIR_PATH, true);
                         TermuxInstaller.setupBootstrapIfNeeded(activity, whenDone);
                     }).show();
-            } catch (WindowManager.BadTokenException e1) {
+            } catch (android.view.WindowManager.BadTokenException e1) {
                 // Activity already dismissed - ignore.
             }
         });
@@ -266,15 +455,14 @@ final class TermuxInstaller {
     private static void sendBootstrapCrashReportNotification(Activity activity, String message) {
         final String title = TermuxConstants.TERMUX_APP_NAME + " Bootstrap Error";
 
-        // Add info of all install Termux plugin apps as well since their target sdk or installation
-        // on external/portable sd card can affect Termux app files directory access or exec.
         TermuxCrashUtils.sendCrashReportNotification(activity, LOG_TAG,
             title, null, "## " + title + "\n\n" + message + "\n\n" +
                 TermuxUtils.getTermuxDebugMarkdownString(activity),
-            true, false, TermuxUtils.AppInfoMode.TERMUX_AND_PLUGIN_PACKAGES, true);
+            true, false, true, true);
     }
 
-    static void setupStorageSymlinks(final Context context) {
+    /** Create the storage symlinks inside the host side home directory shown to the guest. */
+    public static void setupStorageSymlinks(final Context context) {
         final String LOG_TAG = "termux-storage";
         final String title = TermuxConstants.TERMUX_APP_NAME + " Setup Storage Error";
 
@@ -292,72 +480,25 @@ final class TermuxInstaller {
                         Logger.logErrorExtended(LOG_TAG, "Setup Storage Error\n" + error.toString());
                         TermuxCrashUtils.sendCrashReportNotification(context, LOG_TAG, title, null,
                             "## " + title + "\n\n" + Error.getErrorMarkdownString(error),
-                            true, false, TermuxUtils.AppInfoMode.TERMUX_PACKAGE, true);
+                            true, false, true, true);
                         return;
                     }
 
-                    Logger.logInfo(LOG_TAG, "Setting up storage symlinks at ~/storage/shared, ~/storage/downloads, ~/storage/dcim, ~/storage/pictures, ~/storage/music and ~/storage/movies for directories in \"" + Environment.getExternalStorageDirectory().getAbsolutePath() + "\".");
+                    Logger.logInfo(LOG_TAG, "Setting up storage symlinks in \"" + storageDir.getAbsolutePath() + "\".");
 
-                    // Get primary storage root "/storage/emulated/0" symlink
                     File sharedDir = Environment.getExternalStorageDirectory();
                     Os.symlink(sharedDir.getAbsolutePath(), new File(storageDir, "shared").getAbsolutePath());
 
-                    File documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
-                    Os.symlink(documentsDir.getAbsolutePath(), new File(storageDir, "documents").getAbsolutePath());
+                    createPublicDirSymlink(storageDir, "documents", Environment.DIRECTORY_DOCUMENTS);
+                    createPublicDirSymlink(storageDir, "downloads", Environment.DIRECTORY_DOWNLOADS);
+                    createPublicDirSymlink(storageDir, "dcim", Environment.DIRECTORY_DCIM);
+                    createPublicDirSymlink(storageDir, "pictures", Environment.DIRECTORY_PICTURES);
+                    createPublicDirSymlink(storageDir, "music", Environment.DIRECTORY_MUSIC);
+                    createPublicDirSymlink(storageDir, "movies", Environment.DIRECTORY_MOVIES);
+                    createPublicDirSymlink(storageDir, "podcasts", Environment.DIRECTORY_PODCASTS);
 
-                    File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-                    Os.symlink(downloadsDir.getAbsolutePath(), new File(storageDir, "downloads").getAbsolutePath());
-
-                    File dcimDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM);
-                    Os.symlink(dcimDir.getAbsolutePath(), new File(storageDir, "dcim").getAbsolutePath());
-
-                    File picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
-                    Os.symlink(picturesDir.getAbsolutePath(), new File(storageDir, "pictures").getAbsolutePath());
-
-                    File musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC);
-                    Os.symlink(musicDir.getAbsolutePath(), new File(storageDir, "music").getAbsolutePath());
-
-                    File moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
-                    Os.symlink(moviesDir.getAbsolutePath(), new File(storageDir, "movies").getAbsolutePath());
-
-                    File podcastsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PODCASTS);
-                    Os.symlink(podcastsDir.getAbsolutePath(), new File(storageDir, "podcasts").getAbsolutePath());
-
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                        File audiobooksDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_AUDIOBOOKS);
-                        Os.symlink(audiobooksDir.getAbsolutePath(), new File(storageDir, "audiobooks").getAbsolutePath());
-                    }
-
-                    // Dir 0 should ideally be for primary storage
-                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/core/java/android/app/ContextImpl.java;l=818
-                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/core/java/android/os/Environment.java;l=219
-                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/core/java/android/os/Environment.java;l=181
-                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/services/core/java/com/android/server/StorageManagerService.java;l=3796
-                    // https://cs.android.com/android/platform/superproject/+/android-7.0.0_r36:frameworks/base/services/core/java/com/android/server/MountService.java;l=3053
-
-                    // Create "Android/data/com.termux" symlinks
-                    File[] dirs = context.getExternalFilesDirs(null);
-                    if (dirs != null && dirs.length > 0) {
-                        for (int i = 0; i < dirs.length; i++) {
-                            File dir = dirs[i];
-                            if (dir == null) continue;
-                            String symlinkName = "external-" + i;
-                            Logger.logInfo(LOG_TAG, "Setting up storage symlinks at ~/storage/" + symlinkName + " for \"" + dir.getAbsolutePath() + "\".");
-                            Os.symlink(dir.getAbsolutePath(), new File(storageDir, symlinkName).getAbsolutePath());
-                        }
-                    }
-
-                    // Create "Android/media/com.termux" symlinks
-                    dirs = context.getExternalMediaDirs();
-                    if (dirs != null && dirs.length > 0) {
-                        for (int i = 0; i < dirs.length; i++) {
-                            File dir = dirs[i];
-                            if (dir == null) continue;
-                            String symlinkName = "media-" + i;
-                            Logger.logInfo(LOG_TAG, "Setting up storage symlinks at ~/storage/" + symlinkName + " for \"" + dir.getAbsolutePath() + "\".");
-                            Os.symlink(dir.getAbsolutePath(), new File(storageDir, symlinkName).getAbsolutePath());
-                        }
-                    }
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q)
+                        createPublicDirSymlink(storageDir, "audiobooks", Environment.DIRECTORY_AUDIOBOOKS);
 
                     Logger.logInfo(LOG_TAG, "Storage symlinks created successfully.");
                 } catch (Exception e) {
@@ -365,22 +506,19 @@ final class TermuxInstaller {
                     Logger.logStackTraceWithMessage(LOG_TAG, "Setup Storage Error: Error setting up link", e);
                     TermuxCrashUtils.sendCrashReportNotification(context, LOG_TAG, title, null,
                         "## " + title + "\n\n" + Logger.getStackTracesMarkdownString(null, Logger.getStackTracesStringArray(e)),
-                        true, false, TermuxUtils.AppInfoMode.TERMUX_PACKAGE, true);
+                        true, false, true, true);
                 }
             }
         }.start();
     }
 
-    private static Error ensureDirectoryExists(File directory) {
-        return FileUtils.createDirectoryFile(directory.getAbsolutePath());
+    private static void createPublicDirSymlink(File storageDir, String name, String type) {
+        try {
+            File dir = Environment.getExternalStoragePublicDirectory(type);
+            Os.symlink(dir.getAbsolutePath(), new File(storageDir, name).getAbsolutePath());
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Create storage symlink for \"" + name + "\" failed: " + e.getMessage());
+        }
     }
-
-    public static byte[] loadZipBytes() {
-        // Only load the shared library when necessary to save memory usage.
-        System.loadLibrary("termux-bootstrap");
-        return getZip();
-    }
-
-    public static native byte[] getZip();
 
 }

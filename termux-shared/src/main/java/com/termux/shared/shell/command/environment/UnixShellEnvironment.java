@@ -55,6 +55,19 @@ public abstract class UnixShellEnvironment implements IShellEnvironment {
     /** Names for common/supported login shell binaries. */
     public static final String[] LOGIN_SHELL_BINARIES = new String[]{"login", "bash", "zsh", "fish", "sh"};
 
+    /**
+     * Get the names of the binaries to look for, in order, when a session was started without an
+     * explicit executable. The first executable match becomes the session shell.
+     *
+     * An environment may override this since its userland can ship binaries that are not shells.
+     *
+     * @return Should return the login shell binary names.
+     */
+    @NonNull
+    public String[] getLoginShellBinaryNames() {
+        return LOGIN_SHELL_BINARIES;
+    }
+
 
 
     @NonNull
@@ -71,7 +84,8 @@ public abstract class UnixShellEnvironment implements IShellEnvironment {
 
     @NonNull
     @Override
-    public String[] setupShellCommandArguments(@NonNull String executable, @Nullable String[] arguments) {
+    public String[] setupShellCommandArguments(@NonNull String executable, @Nullable String[] arguments,
+                                               @Nullable String workingDirectory) {
         return ShellUtils.setupShellCommandArguments(executable, arguments);
     }
 

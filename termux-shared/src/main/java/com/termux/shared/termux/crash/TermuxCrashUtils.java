@@ -123,7 +123,7 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
 
     @Override
     public String getAppInfoMarkdownString(Context context) {
-        return TermuxUtils.getAppInfoMarkdownString(context, true);
+        return TermuxUtils.getAppInfoMarkdownString(context);
     }
 
     /**
@@ -195,7 +195,7 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
 
         Logger.logDebug(logTag, "A crash log file found at \"" + TermuxConstants.TERMUX_CRASH_LOG_FILE_PATH +  "\".");
 
-        sendCrashReportNotification(context, logTag, null, null, reportString, false, false, null, false);
+        sendCrashReportNotification(context, logTag, null, null, reportString, false, false, false, false);
     }
 
 
@@ -260,7 +260,7 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
                                                    boolean addDeviceInfo) {
         sendCrashReportNotification(currentPackageContext, logTag,
             title, notificationTextString, "## " + title + "\n\n" + message + "\n\n",
-            forceNotification, showToast, TermuxUtils.AppInfoMode.TERMUX_AND_PLUGIN_PACKAGE, addDeviceInfo);
+            forceNotification, showToast, true, addDeviceInfo);
     }
 
     /**
@@ -277,8 +277,7 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
      *                          {@link TermuxPreferenceConstants.TERMUX_APP#KEY_CRASH_REPORT_NOTIFICATIONS_ENABLED}
      *                          is {@code false}.
      * @param showToast If set to {@code true}, then a toast will be shown for {@code notificationTextString}.
-     * @param appInfoMode The {@link TermuxUtils.AppInfoMode} to use to add app info to the message.
-     *                    Set to {@code null} if app info should not be appended to the message.
+     * @param addAppInfo If set to {@code true}, then app info should be appended to the message.
      * @param addDeviceInfo If set to {@code true}, then device info should be appended to the message.
      */
     public static void sendCrashReportNotification(final Context currentPackageContext, String logTag,
@@ -286,7 +285,7 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
                                                    String notificationTextString,
                                                    String message, boolean forceNotification,
                                                    boolean showToast,
-                                                   TermuxUtils.AppInfoMode appInfoMode,
+                                                   boolean addAppInfo,
                                                    boolean addDeviceInfo) {
         // Note: Do not change currentPackageContext or termuxPackageContext passed to functions or things will break
 
@@ -320,8 +319,8 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
 
         StringBuilder reportString = new StringBuilder(message);
 
-        if (appInfoMode != null)
-            reportString.append("\n\n").append(TermuxUtils.getAppInfoMarkdownString(currentPackageContext, appInfoMode, currentPackageName));
+        if (addAppInfo)
+            reportString.append("\n\n").append(TermuxUtils.getAppInfoMarkdownString(currentPackageContext));
 
         if (addDeviceInfo)
             reportString.append("\n\n").append(AndroidUtils.getDeviceInfoMarkdownString(currentPackageContext, true));

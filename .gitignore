@@ -7,6 +7,12 @@ build/
 release/
 *.apk
 *.so
+
+# The arm64 JNI libraries are committed rather than compiled: libproroot*.so is a
+# proprietary closed-source runtime (see proroot README), and the JNI entry points in
+# libtermux.so / liblocal-socket.so are only reachable by name, so a missing .so fails at
+# runtime instead of build time. They live under src/main/jniLibs/arm64-v8a/.
+!**/jniLibs/**/*.so
 .externalNativeBuild
 .cxx
 *.zip

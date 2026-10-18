@@ -93,7 +93,7 @@ public class TermuxSession {
         boolean isLoginShell = false;
         if (executionCommand.executable == null) {
             if (!executionCommand.isFailsafe) {
-                for (String shellBinary : UnixShellEnvironment.LOGIN_SHELL_BINARIES) {
+                for (String shellBinary : shellEnvironmentClient.getLoginShellBinaryNames()) {
                     File shellFile = new File(defaultBinPath, shellBinary);
                     if (shellFile.canExecute()) {
                         executionCommand.executable = shellFile.getAbsolutePath();
@@ -119,7 +119,8 @@ public class TermuxSession {
         }
 
         // Setup command args
-        String[] commandArgs = shellEnvironmentClient.setupShellCommandArguments(executionCommand.executable, executionCommand.arguments);
+        String[] commandArgs = shellEnvironmentClient.setupShellCommandArguments(executionCommand.executable,
+            executionCommand.arguments, executionCommand.workingDirectory);
 
         executionCommand.executable = commandArgs[0];
         String processName = (isLoginShell ? "-" : "") + ShellUtils.getExecutableBasename(executionCommand.executable);

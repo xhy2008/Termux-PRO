@@ -3,40 +3,85 @@ package com.termux.shared.termux.shell.command.environment;
 import android.content.Context;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.termux.shared.errors.Error;
 import com.termux.shared.file.FileUtils;
 import com.termux.shared.logger.Logger;
 import com.termux.shared.shell.command.ExecutionCommand;
-import com.termux.shared.shell.command.environment.AndroidShellEnvironment;
 import com.termux.shared.shell.command.environment.ShellEnvironmentUtils;
 import com.termux.shared.shell.command.environment.ShellCommandShellEnvironment;
-import com.termux.shared.termux.TermuxBootstrap;
+import com.termux.shared.shell.command.environment.UnixShellEnvironment;
 import com.termux.shared.termux.TermuxConstants;
 import com.termux.shared.termux.shell.TermuxShellUtils;
 
+import java.io.File;
 import java.nio.charset.Charset;
 import java.util.HashMap;
 
 /**
- * Environment for Termux.
+ * Environment for the Debian guest running under proroot.
+ *
+ * The command is always started by the {@code libproroot.so} launcher, so the environment handed
+ * to it is a plain Debian guest environment and not an Android environment.
  */
-public class TermuxShellEnvironment extends AndroidShellEnvironment {
+public class TermuxShellEnvironment extends UnixShellEnvironment {
 
     private static final String LOG_TAG = "TermuxShellEnvironment";
 
-    /** Environment variable for the termux {@link TermuxConstants#TERMUX_PREFIX_DIR_PATH}. */
-    public static final String ENV_PREFIX = "PREFIX";
+    protected ShellCommandShellEnvironment shellCommandShellEnvironment;
 
-    public TermuxShellEnvironment() {
-        super();
-        shellCommandShellEnvironment = new TermuxShellCommandShellEnvironment();
+    /** Environment variable for the proroot temporary directory. */
+    public static final String ENV_PROROOT_TMP_DIR = "PROROOT_TMP_DIR";
+
+    /** Directory inside the guest that commands are started in. The host app home directory is
+     * bind mounted here. */
+    public static final String GUEST_HOME_DIR_PATH = "/root";
+
+    /** The launcher that enters the guest rootfs. */
+    public static final String GUEST_LAUNCHER = "libproroot.so";
+
+    /** Guest shell used to interpret guest scripts without a usable shebang. */
+    public static final String GUEST_SHELL = "/bin/bash";
+
+    private static String mGuestLauncherPath;
+
+    /** The host side path of the proroot launcher executable. */
+    @NonNull
+    public static String getGuestLauncherPath() {
+        String path = mGuestLauncherPath;
+        return path != null ? path : GUEST_LAUNCHER;
     }
 
+    /** Guest $PATH. */
+    public static final String GUEST_PATH =
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    /** Guest $TMPDIR. */
+    public static final String GUEST_TMPDIR = "/tmp";
+
+    /**
+     * Shells that accept the `-l` option.
+     *
+     * A Debian userland ships {@code /usr/bin/login}, which the generic list matches before a shell
+     * and which is a util-linux program that rejects `-l`, so it has to be left out.
+     */
+    public static final String[] GUEST_LOGIN_SHELL_BINARIES = new String[]{"bash", "zsh", "fish", "sh"};
+
+    @NonNull
+    @Override
+    public String[] getLoginShellBinaryNames() {
+        return GUEST_LOGIN_SHELL_BINARIES;
+    }
+
+    public TermuxShellEnvironment() {
+        shellCommandShellEnvironment = new TermuxShellCommandShellEnvironment();
+    }
 
     /** Init {@link TermuxShellEnvironment} constants and caches. */
     public synchronized static void init(@NonNull Context currentPackageContext) {
         TermuxAppShellEnvironment.setTermuxAppEnvironment(currentPackageContext);
+        mGuestLauncherPath = new File(currentPackageContext.getApplicationInfo().nativeLibraryDir, GUEST_LAUNCHER).getAbsolutePath();
     }
 
     /** Init {@link TermuxShellEnvironment} constants and caches. */
@@ -59,59 +104,113 @@ public class TermuxShellEnvironment extends AndroidShellEnvironment {
         }
     }
 
-    /** Get shell environment for Termux. */
+    /** Get environment for the Debian guest. */
     @NonNull
     @Override
     public HashMap<String, String> getEnvironment(@NonNull Context currentPackageContext, boolean isFailSafe) {
+        HashMap<String, String> environment = new HashMap<>();
 
-        // Termux environment builds upon the Android environment
-        HashMap<String, String> environment = super.getEnvironment(currentPackageContext, isFailSafe);
-
-        HashMap<String, String> termuxAppEnvironment = TermuxAppShellEnvironment.getEnvironment(currentPackageContext);
-        if (termuxAppEnvironment != null)
-            environment.putAll(termuxAppEnvironment);
-
-        HashMap<String, String> termuxApiAppEnvironment = TermuxAPIShellEnvironment.getEnvironment(currentPackageContext);
-        if (termuxApiAppEnvironment != null)
-            environment.putAll(termuxApiAppEnvironment);
-
-        environment.put(ENV_HOME, TermuxConstants.TERMUX_HOME_DIR_PATH);
-        environment.put(ENV_PREFIX, TermuxConstants.TERMUX_PREFIX_DIR_PATH);
-
-        // If failsafe is not enabled, then we keep default PATH and TMPDIR so that system binaries can be used
-        if (!isFailSafe) {
-            environment.put(ENV_TMPDIR, TermuxConstants.TERMUX_TMP_PREFIX_DIR_PATH);
-            if (TermuxBootstrap.isAppPackageVariantAPTAndroid5()) {
-                // Termux in android 5/6 era shipped busybox binaries in applets directory
-                environment.put(ENV_PATH, TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + ":" + TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH + "/applets");
-                environment.put(ENV_LD_LIBRARY_PATH, TermuxConstants.TERMUX_LIB_PREFIX_DIR_PATH);
-            } else {
-                // Termux binaries on Android 7+ rely on DT_RUNPATH, so LD_LIBRARY_PATH should be unset by default
-                environment.put(ENV_PATH, TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH);
-                environment.remove(ENV_LD_LIBRARY_PATH);
-            }
+        if (isFailSafe) {
+            // The failsafe session runs the Android shell outside the guest, so it keeps the
+            // Android environment.
+            environment.put(ENV_HOME, TermuxConstants.TERMUX_HOME_DIR_PATH);
+            environment.put(ENV_PATH, System.getenv(ENV_PATH));
+            environment.put(ENV_TMPDIR, "/data/local/tmp");
+            environment.put(ENV_TERM, "xterm-256color");
+            ShellEnvironmentUtils.putToEnvIfInSystemEnv(environment, "ANDROID_DATA");
+            ShellEnvironmentUtils.putToEnvIfInSystemEnv(environment, "ANDROID_ROOT");
+            ShellEnvironmentUtils.createHomeDir(environment);
+            return environment;
         }
+
+        environment.put(ENV_HOME, GUEST_HOME_DIR_PATH);
+        environment.put(ENV_PATH, GUEST_PATH);
+        environment.put(ENV_TMPDIR, GUEST_TMPDIR);
+        environment.put(ENV_LANG, "C.UTF-8");
+        environment.put(ENV_COLORTERM, "truecolor");
+        environment.put(ENV_TERM, "xterm-256color");
+
+        // Proroot needs a writable directory for its generated config, fifos and symlinks. It is a
+        // host side path, so it is passed via the environment instead of the command line.
+        String prorootTmpDir = getProrootTmpDir(currentPackageContext);
+        if (prorootTmpDir != null)
+            environment.put(ENV_PROROOT_TMP_DIR, prorootTmpDir);
+
+        // Android runtime paths, some guest binaries like `am` style wrappers expect them
+        ShellEnvironmentUtils.putToEnvIfInSystemEnv(environment, "ANDROID_DATA");
+        ShellEnvironmentUtils.putToEnvIfInSystemEnv(environment, "ANDROID_ROOT");
+        ShellEnvironmentUtils.putToEnvIfInSystemEnv(environment, "ANDROID_STORAGE");
+        ShellEnvironmentUtils.putToEnvIfInSystemEnv(environment, "EXTERNAL_STORAGE");
 
         return environment;
     }
 
+    /** The host side directory proroot uses for its temporary files, created if missing. */
+    public static String getProrootTmpDir(@NonNull Context currentPackageContext) {
+        File dir = new File(currentPackageContext.getCacheDir(), "proroot-tmp");
+        if (!dir.exists() && !dir.mkdirs()) {
+            Logger.logError(LOG_TAG, "Failed to create proroot tmp directory \"" + dir.getAbsolutePath() + "\"");
+            return null;
+        }
+        return dir.getAbsolutePath();
+    }
 
+    /** The host side path of the directory the guest commands are started in. */
     @NonNull
     @Override
     public String getDefaultWorkingDirectoryPath() {
         return TermuxConstants.TERMUX_HOME_DIR_PATH;
     }
 
+    /** The guest binaries directory, used to look for login shell binaries inside the rootfs. */
     @NonNull
     @Override
     public String getDefaultBinPath() {
-        return TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH;
+        return TermuxConstants.TERMUX_ROOTFS_DIR_PATH + "/usr/bin";
     }
 
     @NonNull
     @Override
-    public String[] setupShellCommandArguments(@NonNull String executable, String[] arguments) {
+    public HashMap<String, String> setupShellCommandEnvironment(@NonNull Context currentPackageContext,
+                                                                @NonNull ExecutionCommand executionCommand) {
+        HashMap<String, String> environment = getEnvironment(currentPackageContext, executionCommand.isFailsafe);
+
+        String workingDirectory = executionCommand.workingDirectory;
+        environment.put(ENV_PWD,
+            workingDirectory != null && !workingDirectory.isEmpty() ? new File(workingDirectory).getAbsolutePath() :
+                getDefaultWorkingDirectoryPath());
+
+        // The guest $HOME is inside the rootfs and is created by the rootfs itself, so
+        // ShellEnvironmentUtils.createHomeDir() must not be called for it.
+
+        if (executionCommand.setShellCommandShellEnvironment && shellCommandShellEnvironment != null)
+            environment.putAll(shellCommandShellEnvironment.getEnvironment(currentPackageContext, executionCommand));
+
+        return environment;
+    }
+
+    @NonNull
+    @Override
+    public String[] setupShellCommandArguments(@NonNull String executable, String[] arguments,
+                                               @Nullable String workingDirectory) {
+        // Commands are executed inside the Debian guest rootfs through the proroot launcher. Host
+        // paths that are not visible to the guest, like the /system/bin/sh failsafe shell, are
+        // executed on the host directly.
+        if (TermuxShellUtils.isPathVisibleToGuest(executable))
+            return TermuxShellUtils.setupGuestCommandArguments(executable, arguments, workingDirectory,
+                isLoginShell(executable));
         return TermuxShellUtils.setupShellCommandArguments(executable, arguments);
+    }
+
+    /** Check if the command is a guest login shell, like a new terminal session. */
+    private static boolean isLoginShell(@NonNull String executable) {
+        String guestExecutable = TermuxShellUtils.getGuestPath(executable);
+        String binary = new File(guestExecutable).getName();
+        if (!executable.startsWith("/")) return true;
+        for (String shellBinary : GUEST_LOGIN_SHELL_BINARIES) {
+            if (shellBinary.equals(binary)) return true;
+        }
+        return false;
     }
 
 }
