@@ -35,8 +35,14 @@ public class TermuxShellEnvironment extends UnixShellEnvironment {
     public static final String ENV_PROROOT_TMP_DIR = "PROROOT_TMP_DIR";
 
     /** Directory inside the guest that commands are started in. The host app home directory is
-     * bind mounted here. */
-    public static final String GUEST_HOME_DIR_PATH = "/root";
+     * bind mounted here.
+     *
+     * The guest path is the host path instead of `/root` on purpose. Proroot translates paths from
+     * the libc calls of injected libraries only, so a program that issues `mkdirat` itself, like
+     * the Zig file layer inside the Bun runtime of `opencode`, reaches the Android root, which is
+     * read-only and fails with `EROFS ... mkdir "/root"`. With the home directory bound to the same
+     * absolute path on both sides, a translated path and a raw one name the same directory. */
+    public static final String GUEST_HOME_DIR_PATH = TermuxConstants.TERMUX_HOME_DIR_PATH;
 
     /** The launcher that enters the guest rootfs. */
     public static final String GUEST_LAUNCHER = "libproroot.so";
@@ -57,8 +63,9 @@ public class TermuxShellEnvironment extends UnixShellEnvironment {
     public static final String GUEST_PATH =
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-    /** Guest $TMPDIR. */
-    public static final String GUEST_TMPDIR = "/tmp";
+    /** Guest $TMPDIR. Inside the home directory for the same reason as {@link #GUEST_HOME_DIR_PATH},
+     * since `/tmp` is only translated and does not exist on the Android host. */
+    public static final String GUEST_TMPDIR = GUEST_HOME_DIR_PATH + "/tmp";
 
     /**
      * Shells that accept the `-l` option.
@@ -124,6 +131,10 @@ public class TermuxShellEnvironment extends UnixShellEnvironment {
         }
 
         environment.put(ENV_HOME, GUEST_HOME_DIR_PATH);
+        // Both paths are host side, so they can be created here and are then simply visible to the
+        // guest through the identity bind of the home directory.
+        ShellEnvironmentUtils.createHomeDir(environment);
+        FileUtils.createDirectoryFile("shell tmpdir", GUEST_TMPDIR);
         environment.put(ENV_PATH, GUEST_PATH);
         environment.put(ENV_TMPDIR, GUEST_TMPDIR);
         environment.put(ENV_LANG, "C.UTF-8");
@@ -180,8 +191,9 @@ public class TermuxShellEnvironment extends UnixShellEnvironment {
             workingDirectory != null && !workingDirectory.isEmpty() ? new File(workingDirectory).getAbsolutePath() :
                 getDefaultWorkingDirectoryPath());
 
-        // The guest $HOME is inside the rootfs and is created by the rootfs itself, so
-        // ShellEnvironmentUtils.createHomeDir() must not be called for it.
+        // $HOME is a host side path that getEnvironment() already created, so nothing to do here.
+        // It must not be looked up in the rootfs, since the guest home is the bind mounted app home
+        // directory and not the /root directory of the Debian image.
 
         if (executionCommand.setShellCommandShellEnvironment && shellCommandShellEnvironment != null)
             environment.putAll(shellCommandShellEnvironment.getEnvironment(currentPackageContext, executionCommand));
