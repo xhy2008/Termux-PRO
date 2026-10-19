@@ -132,9 +132,13 @@ public class TermuxShellEnvironment extends UnixShellEnvironment {
 
         environment.put(ENV_HOME, GUEST_HOME_DIR_PATH);
         // Both paths are host side, so they can be created here and are then simply visible to the
-        // guest through the identity bind of the home directory.
+        // guest through the identity bind of the home directory. The matching directories inside the
+        // rootfs are needed as well, since the launcher resolves the working directory and the bind
+        // target relative to the rootfs and refuses to start when they are missing.
         ShellEnvironmentUtils.createHomeDir(environment);
         FileUtils.createDirectoryFile("shell tmpdir", GUEST_TMPDIR);
+        FileUtils.createDirectoryFile("guest home", getGuestHomeDirPath());
+        FileUtils.createDirectoryFile("guest tmpdir", getGuestPathFor(GUEST_TMPDIR));
         environment.put(ENV_PATH, GUEST_PATH);
         environment.put(ENV_TMPDIR, GUEST_TMPDIR);
         environment.put(ENV_LANG, "C.UTF-8");
@@ -164,6 +168,20 @@ public class TermuxShellEnvironment extends UnixShellEnvironment {
             return null;
         }
         return dir.getAbsolutePath();
+    }
+
+    /** The path {@link #GUEST_HOME_DIR_PATH} has inside the rootfs directory on the host. Proroot
+     * resolves the working directory and the bind target relative to the rootfs, so the guest home
+     * has to exist here as well or the launcher fails with `chdir workdir failed`. */
+    @NonNull
+    public static String getGuestHomeDirPath() {
+        return TermuxConstants.TERMUX_ROOTFS_DIR_PATH + GUEST_HOME_DIR_PATH;
+    }
+
+    /** The path of a guest path like {@link #GUEST_TMPDIR} inside the rootfs directory on the host. */
+    @NonNull
+    public static String getGuestPathFor(@NonNull String guestPath) {
+        return TermuxConstants.TERMUX_ROOTFS_DIR_PATH + guestPath;
     }
 
     /** The host side path of the directory the guest commands are started in. */
